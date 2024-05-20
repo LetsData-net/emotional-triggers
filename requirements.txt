@@ -1,0 +1,10 @@
+tqdm
+labelbox
+pandas
+numpy
+elasticsearch
+openai
+tiktoken
+langchain
+langchainhub
+scikit-learn
