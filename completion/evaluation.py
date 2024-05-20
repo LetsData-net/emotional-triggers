@@ -32,10 +32,6 @@ def evaluate_classification(true_labels, predicted_labels):
     return classification_report(true_labels, predicted_labels, output_dict=True)
 
 
-def evaluate_spans_detection():
-    pass
-
-
 def get_classification_report(df_true: pd.DataFrame, df_predicted: pd.DataFrame, column_name: str) -> dict:
     return evaluate_classification(true_labels=df_true[column_name].tolist(),
                                    predicted_labels=df_predicted[column_name].tolist())
