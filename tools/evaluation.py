@@ -6,10 +6,11 @@ import tiktoken
 import numpy as np
 import pandas as pd
 
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, classification_report
+from sklearn.metrics import precision_score, recall_score, f1_score
 
 PERSONAS_LIST = ["persona_1", "persona_2"]
-APPROACHES_LIST = ["no_context", "context_pure", "context_few_shot_5", "context_few_shot_10", "context_fine_tuning"]
+RANDOM_SEEDS = [7, 33, 42]
+APPROACHES_LIST = ["no_context", "context_zero_shot", "context_few_shot_5", "context_few_shot_10", "context_fine_tuning"]
 
 DATA_DIR = 'data'
 
@@ -19,17 +20,15 @@ encoding = tiktoken.get_encoding("cl100k_base")
 
 
 def evaluate_classification(true_labels, predicted_labels):
-    accuracy = accuracy_score(true_labels, predicted_labels)
     precision = precision_score(true_labels, predicted_labels, average='weighted')
     recall = recall_score(true_labels, predicted_labels, average='weighted')
     f1 = f1_score(true_labels, predicted_labels, average='weighted')
 
-    print("Accuracy:", accuracy)
     print("Precision:", precision)
     print("Recall:", recall)
     print("F1 Score:", f1)
 
-    return classification_report(true_labels, predicted_labels, output_dict=True)
+    return {"precision": precision, "recall": recall, "f1_score": f1}
 
 
 def get_classification_report(df_true: pd.DataFrame, df_predicted: pd.DataFrame, column_name: str) -> dict:
@@ -85,18 +84,17 @@ def calc_proportional_match(true_labels, predicted_labels, corrupted_labels):
 
 
 def get_spans_detection_report(df_true: pd.DataFrame, df_predicted: pd.DataFrame, column_name: str) -> dict:
-    strict = calc_strict_match(true_labels=df_true["context"].tolist(),
-                               predicted_labels=df_predicted["context"].tolist(),
-                               corrupted_labels=df_predicted["context_corrupted"].tolist())
-    proportional = calc_proportional_match(true_labels=df_true["context_locations"].tolist(),
-                                           predicted_labels=df_predicted["context_locations"].tolist(),
-                                           corrupted_labels=df_predicted["context_corrupted"].tolist())
-    print(strict)
-    print(proportional)
-    return {
-        "strict": strict,
-        "proportional": proportional,
-    }
+    if column_name == 'strict':
+        report = calc_strict_match(true_labels=df_true["context"].tolist(),
+                                   predicted_labels=df_predicted["context"].tolist(),
+                                   corrupted_labels=df_predicted["context_corrupted"].tolist())
+    elif column_name == 'proportional':
+        report = calc_proportional_match(true_labels=df_true["context_locations"].tolist(),
+                                         predicted_labels=df_predicted["context_locations"].tolist(),
+                                         corrupted_labels=df_predicted["context_corrupted"].tolist())
+    else:
+        raise ValueError(column_name)
+    return report
 
 
 def compare(df_true, df_predicted, column_name):
@@ -106,16 +104,17 @@ def compare(df_true, df_predicted, column_name):
     df_compare.to_csv(f'compare_{column_name}.csv', index=None)
 
 
-def get_report(df_true: pd.DataFrame, df_predicted: pd.DataFrame, column_name: str):
+def get_report(df_true: pd.DataFrame, df_predicted: pd.DataFrame, column_name: str, overlap_type: str = None):
     print("Column:", column_name)
     if column_name in ["context", "context_locations"]:
-        report = get_spans_detection_report(df_true, df_predicted, column_name)
+        report = get_spans_detection_report(df_true, df_predicted, overlap_type)
+        return {f'{column_name}_{overlap_type}_{k}': v for k, v in report.items()}
     elif column_name in ["emotion", "emotion_class", "trigger_level"]:
         report = get_classification_report(df_true, df_predicted, column_name)
+        return {f'{column_name}_{k}': v for k, v in report.items()}
         # compare(df_true, df_predicted, column_name)
     else:
         raise ValueError(column_name)
-    return {column_name: report}
 
 
 def load_true(file_name: str) -> pd.DataFrame:
@@ -142,6 +141,9 @@ def process_and_validate_context(data: pd.DataFrame) -> pd.DataFrame:
                     corrupted_context += [context_list]
                     context_list = []
         for context_item in context_list:
+            if isinstance(context_item, list):
+                corrupted_context.append(context_item)
+                continue
             start = data_row["text"].lower().find(context_item.lower())
             if start != -1:
                 context_locations.append((start, start+len(context_item)))
@@ -155,19 +157,25 @@ def process_and_validate_context(data: pd.DataFrame) -> pd.DataFrame:
     return processed_data
 
 
-def load_predicted(persona_name, approach) -> pd.DataFrame:
+def load_predicted(persona_name, approach, seed) -> pd.DataFrame:
     predictions = list()
 
     if approach == "no_context":
         persona_name = "assistant"
 
-    file_name = f"{DATA_DIR}/completed/{persona_name}_{approach}.jsonl"
+    file_name = f"{DATA_DIR}/completed/{persona_name}_{approach}_seed={seed}.jsonl"
     with open(file_name) as input_file:
         for line in input_file.readlines():
             predictions.append(json.loads(line))
 
     df_predicted = pd.DataFrame(predictions)
     print(df_predicted.shape)
+
+    df_predicted_output = pd.json_normalize(df_predicted["output"])
+    df_predicted = pd.concat([df_predicted.drop(columns=["output"]), df_predicted_output], axis=1)
+    print(df_predicted.shape)
+
+    assert len(df_predicted) == 166
 
     texts = pd.read_csv(f"{DATA_DIR}/labelbox_sample.csv")[["id", "text"]]
     print(texts.shape)
@@ -179,9 +187,23 @@ def load_predicted(persona_name, approach) -> pd.DataFrame:
 
     df_predicted = process_and_validate_context(df_predicted)
 
+    df_predicted['trigger_level'] = df_predicted['trigger_level'].apply(get_int)
+    df_predicted['emotion_class'] = np.where(~df_predicted['emotion_class'].isin(['positive', 'negative']),
+                                             'corrupted', df_predicted['emotion_class'])
+    df_predicted['emotion'] = np.where(
+        ~df_predicted['emotion'].isin(['anger', 'love', 'joy', 'surprise', 'fear', 'sadness', 'undefined']
+                                      ), 'corrupted', df_predicted['emotion'])
+
     df_predicted = df_predicted.sort_values(by='id').reset_index(drop=True)
 
     return df_predicted
+
+
+def get_int(val):
+    try:
+        return int(val)
+    except:
+        return -1
 
 
 def generate_beautiful_report(full_report, report_name="report"):
@@ -219,41 +241,92 @@ def generate_beautiful_report(full_report, report_name="report"):
     df_simple.to_csv(f"{report_name}_simple.csv", index=None)
 
 
+def add_mean_std_row(df):
+    # Check if DataFrame is empty
+    if df.empty:
+        return df
+
+    # Calculate mean and std for all numerical columns
+    stats = df.select_dtypes(include=[np.number]).agg(['mean', 'std'])
+
+    # Calculate the mean ± 3*std for each numerical column
+    result_row = stats.loc['mean'].round(3).astype(str) + '±' + (3 * stats.loc['std']).round(2).astype(str)
+
+    # Append the new row to the DataFrame
+    new_row = pd.DataFrame([result_row], columns=df.select_dtypes(include=[np.number]).columns)
+
+    # Combine the new row with the original DataFrame
+    result_df = pd.concat([df, new_row], ignore_index=True)
+
+    # Fill non-numeric columns in the new row with NaN
+    non_numeric_cols = df.select_dtypes(exclude=[np.number]).columns
+    for col in non_numeric_cols:
+        if col == 'persona_name':
+            val = 'average'
+        elif col == 'approach_name':
+            val = result_df.approach_name.values[0]
+        else:
+            val = np.nan
+        result_df.loc[result_df.index[-1], col] = val
+
+    return result_df
+
+
 def main():
 
     full_report = dict()
 
-    for persona_name in PERSONAS_LIST:
-        full_report[persona_name] = dict()
+    for approach in APPROACHES_LIST:
 
-        for approach in APPROACHES_LIST:
-            full_report[persona_name][approach] = dict()
+        full_report[approach] = list()
 
-            df_true = load_true(f"{DATA_DIR}/train_test_eval_split/{annotator2persona_mapping[persona_name]}_evaluation.csv")
-            df_predicted = load_predicted(persona_name, approach)
+        for persona_name in PERSONAS_LIST:
 
-            assert len(df_true) == len(df_predicted), "len mismatch"
-            assert np.alltrue([i1 == i2 for i1, i2 in zip(df_true.id, df_predicted.id)]), "ids mismatch"
+            df_true_ = load_true(
+                f"{DATA_DIR}/train_test_eval_split/{annotator2persona_mapping[persona_name]}_evaluation.csv")
 
-            failed_to_generate = df_predicted[df_predicted["emotion"].isna() |
-                                              df_predicted["emotion_class"].isna() |
-                                              df_predicted["trigger_level"].isna()]["id"].tolist()
-            df_true = df_true[~df_true["id"].isin(failed_to_generate)]
-            df_predicted = df_predicted[~df_predicted["id"].isin(failed_to_generate)]
+            for seed in RANDOM_SEEDS:
 
-            full_report[persona_name][approach]["failed"] = len(failed_to_generate)
-            full_report[persona_name][approach].update(get_report(df_true, df_predicted, "emotion"))
-            full_report[persona_name][approach].update(get_report(df_true, df_predicted, "emotion_class"))
-            full_report[persona_name][approach].update(get_report(df_true, df_predicted, "trigger_level"))
-            full_report[persona_name][approach].update(get_report(df_true, df_predicted, "context"))
+                df_true = df_true_.copy()
 
-            print(full_report[persona_name][approach])
+                df_predicted = load_predicted(persona_name, approach, seed)
 
-    report_name = "report"
-    with open(f"{report_name}.json", "w") as output_file:
-        json.dump(full_report, output_file)
+                assert len(df_true) == len(df_predicted), "len mismatch"
+                assert np.alltrue([i1 == i2 for i1, i2 in zip(df_true.id, df_predicted.id)]), "ids mismatch"
 
-    generate_beautiful_report(full_report, report_name=report_name)
+                failed_to_generate = df_predicted[(df_predicted["emotion"] == 'corrupted') |
+                                                  (df_predicted["emotion_class"] == 'corrupted') |
+                                                  (df_predicted["trigger_level"] == -1)]["id"].tolist()
+
+                emotion_report = get_report(df_true, df_predicted, "emotion")
+                emotion_class_report = get_report(df_true, df_predicted, "emotion_class")
+                trigger_level_report = get_report(df_true, df_predicted, "trigger_level")
+                strict_context_report = get_report(df_true, df_predicted, "context", "strict")
+                proportional_context_report = get_report(df_true, df_predicted, "context", "proportional")
+
+                item = {
+                    'failed': len(failed_to_generate)/len(df_true),
+                    'seed': seed,
+                    'persona_name': persona_name,
+                    'approach_name': approach,
+                }
+                item.update(emotion_report)
+                item.update(emotion_class_report)
+                item.update(trigger_level_report)
+                item.update(trigger_level_report)
+                item.update(strict_context_report)
+                item.update(proportional_context_report)
+
+                full_report[approach].append(item)
+
+        approach_report = pd.DataFrame(full_report[approach])
+        approach_report = add_mean_std_row(approach_report)
+        full_report[approach] = approach_report
+
+    df = pd.concat(full_report.values()).drop(columns=['seed'])
+    df = df[df.persona_name == 'average']
+    df.to_csv('report_all.csv', index=None)
+    print(df)
 
 
 if __name__ == '__main__':
